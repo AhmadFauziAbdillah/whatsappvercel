@@ -1,22 +1,136 @@
 import { default as makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
-import fs from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import qrcode from 'qrcode';
+import { MongoClient } from 'mongodb';
 
-// Global variables untuk persistent connection
+// MongoDB untuk menyimpan session di Vercel (karena filesystem tidak persistent)
+const MONGODB_URI = process.env.MONGODB_URI || 'your-mongodb-connection-string';
+let cachedDb = null;
 let sock = null;
-let qrCode = null;
+let qrCodeData = null;
 let isConnected = false;
-let lastActivity = Date.now();
-const CONNECTION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
-// Auth folder di /tmp (ephemeral di Vercel)
-const authFolder = join(tmpdir(), 'auth_info_baileys');
+// MongoDB Connection
+async function connectToDatabase() {
+    if (cachedDb) {
+        return cachedDb;
+    }
 
-// Ensure auth folder exists
-if (!fs.existsSync(authFolder)) {
-    fs.mkdirSync(authFolder, { recursive: true });
+    const client = await MongoClient.connect(MONGODB_URI);
+    const db = client.db('whatsapp_bot');
+    cachedDb = db;
+    return db;
+}
+
+// Custom Auth State untuk MongoDB
+async function useMongoDBAuthState() {
+    const db = await connectToDatabase();
+    const collection = db.collection('auth_state');
+
+    const writeData = async (data, key) => {
+        await collection.updateOne(
+            { key },
+            { $set: { data, key, updatedAt: new Date() } },
+            { upsert: true }
+        );
+    };
+
+    const readData = async (key) => {
+        const doc = await collection.findOne({ key });
+        return doc ? doc.data : null;
+    };
+
+    const removeData = async (key) => {
+        await collection.deleteOne({ key });
+    };
+
+    const state = {
+        creds: await readData('creds') || undefined,
+        keys: {
+            get: async (type, ids) => {
+                const data = {};
+                for (const id of ids) {
+                    const key = `${type}-${id}`;
+                    const value = await readData(key);
+                    if (value) data[id] = value;
+                }
+                return data;
+            },
+            set: async (data) => {
+                for (const category in data) {
+                    for (const id in data[category]) {
+                        const key = `${category}-${id}`;
+                        await writeData(data[category][id], key);
+                    }
+                }
+            }
+        }
+    };
+
+    const saveCreds = async () => {
+        if (sock?.authState?.creds) {
+            await writeData(sock.authState.creds, 'creds');
+        }
+    };
+
+    return { state, saveCreds };
+}
+
+// Initialize WhatsApp Connection
+async function initWhatsApp() {
+    if (sock && isConnected) {
+        return sock;
+    }
+
+    try {
+        const { version } = await fetchLatestBaileysVersion();
+        const { state, saveCreds } = await useMongoDBAuthState();
+
+        sock = makeWASocket({
+            version,
+            auth: state,
+            logger: pino({ level: 'silent' }),
+            browser: ['Warranty Bot Vercel', 'Chrome', '4.0.0'],
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 0,
+            keepAliveIntervalMs: 10000,
+            getMessage: async (key) => {
+                return { conversation: '' };
+            }
+        });
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                qrCodeData = await qrcode.toDataURL(qr);
+                console.log('QR Code generated');
+            }
+
+            if (connection === 'close') {
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                console.log('Connection closed, reconnect:', shouldReconnect);
+                
+                isConnected = false;
+                sock = null;
+                
+                if (shouldReconnect) {
+                    setTimeout(() => initWhatsApp(), 5000);
+                }
+            } else if (connection === 'open') {
+                console.log('WhatsApp Connected!');
+                isConnected = true;
+                qrCodeData = null;
+            }
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        return sock;
+    } catch (error) {
+        console.error('WhatsApp init error:', error);
+        throw error;
+    }
 }
 
 // Format phone number
@@ -30,96 +144,7 @@ function formatPhoneNumber(phone) {
     return formatted;
 }
 
-// Connect to WhatsApp
-async function connectToWhatsApp() {
-    if (sock && isConnected) {
-        lastActivity = Date.now();
-        return sock;
-    }
-
-    try {
-        console.log('🔄 Connecting to WhatsApp...');
-        
-        const { version } = await fetchLatestBaileysVersion();
-        const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-        
-        sock = makeWASocket({
-            version,
-            auth: state,
-            logger: pino({ level: 'silent' }),
-            browser: ['Warranty Bot Vercel', 'Chrome', '4.0.0'],
-            connectTimeoutMs: 30000,
-            defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 10000,
-            getMessage: async (key) => ({ conversation: '' })
-        });
-
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('Connection timeout'));
-            }, 45000);
-
-            sock.ev.on('connection.update', async (update) => {
-                const { connection, lastDisconnect, qr } = update;
-                
-                if (qr) {
-                    console.log('📱 QR Code generated');
-                    qrCode = qr;
-                    clearTimeout(timeout);
-                    resolve({ qr, needsScan: true });
-                }
-                
-                if (connection === 'close') {
-                    const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    isConnected = false;
-                    
-                    if (statusCode === DisconnectReason.loggedOut) {
-                        console.log('🚪 Logged out');
-                        qrCode = null;
-                        // Clear auth
-                        try {
-                            const files = fs.readdirSync(authFolder);
-                            files.forEach(file => fs.unlinkSync(join(authFolder, file)));
-                        } catch (err) {
-                            console.error('Clear auth error:', err);
-                        }
-                    }
-                    clearTimeout(timeout);
-                    reject(new Error('Connection closed'));
-                }
-                
-                if (connection === 'open') {
-                    console.log('✅ Connected!');
-                    isConnected = true;
-                    qrCode = null;
-                    lastActivity = Date.now();
-                    clearTimeout(timeout);
-                    resolve({ connected: true });
-                }
-            });
-
-            sock.ev.on('creds.update', saveCreds);
-        });
-    } catch (error) {
-        console.error('❌ Connection error:', error.message);
-        throw error;
-    }
-}
-
-// Keep connection alive
-function keepAlive() {
-    if (sock && isConnected) {
-        const inactive = Date.now() - lastActivity;
-        if (inactive > CONNECTION_TIMEOUT) {
-            console.log('⚠️ Connection inactive, closing...');
-            sock.end();
-            sock = null;
-            isConnected = false;
-        }
-    }
-}
-
-// Main handler for Vercel
+// Main Handler untuk Vercel Serverless Functions
 export default async function handler(req, res) {
     // Enable CORS
     res.setHeader('Access-Control-Allow-Credentials', true);
@@ -128,260 +153,59 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
     if (req.method === 'OPTIONS') {
-        res.status(200).end();
-        return;
+        return res.status(200).end();
     }
-
-    keepAlive();
 
     const { pathname } = new URL(req.url, `http://${req.headers.host}`);
 
     try {
-        // Route: Home/Status
-        if (pathname === '/' || pathname === '/api') {
-            return res.status(200).send(`
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>WhatsApp Bot API - Vercel</title>
-                    <meta name="viewport" content="width=device-width, initial-scale=1">
-                    <style>
-                        * { margin: 0; padding: 0; box-sizing: border-box; }
-                        body {
-                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                            min-height: 100vh;
-                            padding: 20px;
-                        }
-                        .container {
-                            max-width: 800px;
-                            margin: 40px auto;
-                            background: white;
-                            border-radius: 20px;
-                            padding: 40px;
-                            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                        }
-                        h1 { color: #333; margin-bottom: 20px; }
-                        .status {
-                            padding: 12px 24px;
-                            border-radius: 25px;
-                            display: inline-block;
-                            font-weight: bold;
-                            margin: 15px 0;
-                        }
-                        .connected { background: #10b981; color: white; }
-                        .disconnected { background: #ef4444; color: white; }
-                        .info {
-                            background: #f3f4f6;
-                            padding: 20px;
-                            border-radius: 10px;
-                            margin: 20px 0;
-                        }
-                        .endpoint {
-                            background: #f9fafb;
-                            padding: 15px;
-                            border-radius: 8px;
-                            margin: 10px 0;
-                            border-left: 4px solid #667eea;
-                        }
-                        .endpoint code {
-                            background: #e5e7eb;
-                            padding: 8px;
-                            border-radius: 4px;
-                            display: block;
-                            margin-top: 8px;
-                            font-size: 0.9em;
-                        }
-                        .warning {
-                            background: #fef3c7;
-                            padding: 15px;
-                            border-radius: 8px;
-                            margin: 15px 0;
-                            border-left: 4px solid #f59e0b;
-                        }
-                        button {
-                            background: #667eea;
-                            color: white;
-                            border: none;
-                            padding: 12px 24px;
-                            border-radius: 8px;
-                            cursor: pointer;
-                            font-weight: bold;
-                            margin: 5px;
-                        }
-                        button:hover { background: #5568d3; }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>🤖 WhatsApp Bot API</h1>
-                        <div class="status ${isConnected ? 'connected' : 'disconnected'}" id="status">
-                            ${isConnected ? '✅ Connected' : '❌ Disconnected'}
-                        </div>
-                        
-                        <div class="warning">
-                            <strong>⚠️ Vercel Serverless Mode</strong>
-                            <p>Bot berjalan dalam mode serverless. Koneksi akan timeout setelah 5 menit tidak aktif. 
-                            Auth tersimpan di ephemeral storage (/tmp) dan akan hilang saat cold start.</p>
-                        </div>
-
-                        <div class="info">
-                            <p><strong>📡 Status:</strong> <span id="connectionStatus">${isConnected ? 'Connected' : 'Disconnected'}</span></p>
-                            <p><strong>📱 Bot Number:</strong> <span id="botNumber">-</span></p>
-                            <p><strong>🔑 QR Available:</strong> <span id="qrStatus">${qrCode ? 'Yes' : 'No'}</span></p>
-                        </div>
-
-                        <div style="margin: 20px 0;">
-                            <button onclick="checkStatus()">🔄 Refresh Status</button>
-                            <button onclick="getQR()">📱 Get QR Code</button>
-                            <button onclick="testMessage()" style="background: #10b981;">📤 Test Send</button>
-                        </div>
-
-                        <div id="qrDisplay" style="text-align: center; margin: 20px 0;"></div>
-
-                        <h3 style="margin-top: 30px;">📚 API Endpoints</h3>
-                        
-                        <div class="endpoint">
-                            <strong>GET /api/status</strong>
-                            <p>Get connection status</p>
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>GET /api/qr</strong>
-                            <p>Get QR code for pairing</p>
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>POST /api/connect</strong>
-                            <p>Initialize connection</p>
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>POST /api/send</strong>
-                            <p>Send WhatsApp message</p>
-                            <code>{ "phone": "6281234567890", "message": "Hello!" }</code>
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>POST /api/clear</strong>
-                            <p>Clear auth and reset</p>
-                        </div>
-                    </div>
-
-                    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-                    <script>
-                        async function checkStatus() {
-                            const res = await fetch('/api/status');
-                            const data = await res.json();
-                            document.getElementById('connectionStatus').textContent = data.connected ? 'Connected ✅' : 'Disconnected ❌';
-                            document.getElementById('qrStatus').textContent = data.qrAvailable ? 'Yes' : 'No';
-                            document.getElementById('botNumber').textContent = data.botNumber || '-';
-                            document.getElementById('status').className = 'status ' + (data.connected ? 'connected' : 'disconnected');
-                            document.getElementById('status').textContent = data.connected ? '✅ Connected' : '❌ Disconnected';
-                        }
-
-                        async function getQR() {
-                            const res = await fetch('/api/qr');
-                            const data = await res.json();
-                            
-                            if (data.qr) {
-                                const container = document.getElementById('qrDisplay');
-                                container.innerHTML = '<h3>📱 Scan QR Code</h3><div id="qrcode"></div>';
-                                new QRCode(document.getElementById('qrcode'), {
-                                    text: data.qr,
-                                    width: 256,
-                                    height: 256
-                                });
-                            } else {
-                                alert(data.message || 'QR not available');
-                            }
-                        }
-
-                        async function testMessage() {
-                            const phone = prompt('Enter phone number (e.g., 6281234567890):');
-                            if (!phone) return;
-                            
-                            const res = await fetch('/api/send', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    phone: phone,
-                                    message: 'Test message from Vercel bot!'
-                                })
-                            });
-                            const data = await res.json();
-                            alert(data.success ? '✅ Message sent!' : '❌ Error: ' + data.error);
-                        }
-
-                        // Auto refresh status
-                        setInterval(checkStatus, 5000);
-                        checkStatus();
-                    </script>
-                </body>
-                </html>
-            `);
+        // Root - Landing Page
+        if (pathname === '/' && req.method === 'GET') {
+            const html = generateLandingPage();
+            res.setHeader('Content-Type', 'text/html');
+            return res.status(200).send(html);
         }
 
-        // Route: Status
-        if (pathname === '/api/status') {
+        // Get QR Code
+        if (pathname === '/qr' && req.method === 'GET') {
+            if (!sock || !isConnected) {
+                await initWhatsApp();
+            }
+
+            if (qrCodeData) {
+                return res.status(200).json({
+                    success: true,
+                    qr: qrCodeData,
+                    message: 'Scan this QR code with WhatsApp'
+                });
+            } else if (isConnected) {
+                return res.status(200).json({
+                    success: false,
+                    message: 'Already connected',
+                    connected: true
+                });
+            } else {
+                return res.status(200).json({
+                    success: false,
+                    message: 'QR not available yet, please wait...',
+                    connected: false
+                });
+            }
+        }
+
+        // Status Check
+        if (pathname === '/status' && req.method === 'GET') {
             return res.status(200).json({
-                connected: isConnected,
-                qrAvailable: !!qrCode,
+                status: isConnected ? 'connected' : 'disconnected',
+                qrRequired: !isConnected && !qrCodeData,
+                qrAvailable: !!qrCodeData,
                 botNumber: sock?.user?.id ? sock.user.id.split(':')[0] : null,
-                lastActivity: lastActivity,
                 timestamp: new Date().toISOString()
             });
         }
 
-        // Route: Connect
-        if (pathname === '/api/connect' && req.method === 'POST') {
-            try {
-                const result = await connectToWhatsApp();
-                return res.status(200).json({
-                    success: true,
-                    ...result
-                });
-            } catch (error) {
-                return res.status(500).json({
-                    success: false,
-                    error: error.message
-                });
-            }
-        }
-
-        // Route: Get QR
-        if (pathname === '/api/qr') {
-            if (isConnected) {
-                return res.status(200).json({
-                    success: false,
-                    message: 'Already connected'
-                });
-            }
-
-            if (!qrCode) {
-                try {
-                    await connectToWhatsApp();
-                } catch (err) {
-                    // QR might be generated even if connection fails
-                }
-            }
-
-            if (qrCode) {
-                return res.status(200).json({
-                    success: true,
-                    qr: qrCode,
-                    message: 'Scan this QR code with WhatsApp'
-                });
-            } else {
-                return res.status(503).json({
-                    success: false,
-                    message: 'QR code not available yet. Try /api/connect first'
-                });
-            }
-        }
-
-        // Route: Send Message
-        if (pathname === '/api/send' && req.method === 'POST') {
+        // Send Message
+        if (pathname === '/send-message' && req.method === 'POST') {
             const { phone, message } = req.body;
 
             if (!phone || !message) {
@@ -392,70 +216,57 @@ export default async function handler(req, res) {
             }
 
             if (!isConnected || !sock) {
-                return res.status(503).json({
-                    success: false,
-                    error: 'Bot not connected. Get QR code at /api/qr'
-                });
-            }
-
-            try {
-                const formattedPhone = formatPhoneNumber(phone);
-                const jid = `${formattedPhone}@s.whatsapp.net`;
-
-                const [exists] = await sock.onWhatsApp(jid);
-                if (!exists) {
-                    return res.status(404).json({
+                // Try to reconnect
+                await initWhatsApp();
+                
+                if (!isConnected) {
+                    return res.status(503).json({
                         success: false,
-                        error: 'Phone number not registered on WhatsApp'
+                        error: 'WhatsApp bot is not connected',
+                        hint: 'Please scan QR code first'
                     });
                 }
+            }
 
-                const result = await sock.sendMessage(jid, { text: message });
-                lastActivity = Date.now();
+            const formattedPhone = formatPhoneNumber(phone);
+            const jid = `${formattedPhone}@s.whatsapp.net`;
 
-                return res.status(200).json({
-                    success: true,
-                    message: 'Message sent successfully',
-                    to: formattedPhone,
-                    messageId: result.key.id
-                });
-            } catch (error) {
-                return res.status(500).json({
+            // Check if number exists
+            const [exists] = await sock.onWhatsApp(jid);
+            if (!exists) {
+                return res.status(404).json({
                     success: false,
-                    error: error.message
+                    error: 'Phone number not registered on WhatsApp',
+                    phone: formattedPhone
                 });
             }
+
+            // Send message
+            const result = await sock.sendMessage(jid, { text: message });
+
+            return res.status(200).json({
+                success: true,
+                message: 'Message sent successfully',
+                to: formattedPhone,
+                messageId: result.key.id,
+                timestamp: new Date().toISOString()
+            });
         }
 
-        // Route: Clear Auth
-        if (pathname === '/api/clear' && req.method === 'POST') {
-            try {
-                if (sock) {
-                    sock.end();
-                    sock = null;
-                }
-                isConnected = false;
-                qrCode = null;
-
-                const files = fs.readdirSync(authFolder);
-                files.forEach(file => fs.unlinkSync(join(authFolder, file)));
-
-                return res.status(200).json({
-                    success: true,
-                    message: 'Auth cleared successfully'
-                });
-            } catch (error) {
-                return res.status(500).json({
-                    success: false,
-                    error: error.message
-                });
-            }
+        // Health Check
+        if (pathname === '/health' && req.method === 'GET') {
+            return res.status(200).json({
+                status: 'ok',
+                service: 'whatsapp-bot-vercel',
+                connected: isConnected,
+                timestamp: new Date().toISOString()
+            });
         }
 
-        // 404
+        // Not Found
         return res.status(404).json({
-            error: 'Endpoint not found',
-            available: ['/api/status', '/api/qr', '/api/connect', '/api/send', '/api/clear']
+            success: false,
+            error: 'Endpoint not found'
         });
 
     } catch (error) {
@@ -466,3 +277,205 @@ export default async function handler(req, res) {
         });
     }
 }
+
+// Generate Landing Page HTML
+function generateLandingPage() {
+    return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WhatsApp Bot API - Vercel</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+            .container {
+                background: white;
+                border-radius: 20px;
+                padding: 40px;
+                max-width: 600px;
+                width: 100%;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            }
+            h1 {
+                color: #333;
+                margin-bottom: 10px;
+                font-size: 2em;
+            }
+            .status {
+                display: inline-block;
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-weight: bold;
+                margin: 20px 0;
+            }
+            .connected { background: #10b981; color: white; }
+            .disconnected { background: #ef4444; color: white; }
+            .info {
+                background: #f3f4f6;
+                padding: 20px;
+                border-radius: 10px;
+                margin: 20px 0;
+            }
+            .info p {
+                margin: 10px 0;
+                color: #666;
+                font-size: 0.95em;
+            }
+            .endpoints {
+                margin-top: 30px;
+            }
+            .endpoint {
+                background: #f9fafb;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 10px 0;
+                border-left: 4px solid #667eea;
+            }
+            .endpoint code {
+                background: #e5e7eb;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 0.85em;
+                word-break: break-all;
+                display: block;
+                margin-top: 8px;
+            }
+            button {
+                background: #667eea;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 1em;
+                font-weight: bold;
+                margin: 10px 5px;
+                transition: all 0.3s;
+            }
+            button:hover {
+                background: #5568d3;
+                transform: translateY(-2px);
+            }
+            #qrcode {
+                margin: 20px auto;
+                padding: 20px;
+                background: white;
+                display: inline-block;
+                border-radius: 10px;
+            }
+            .qr-section {
+                text-align: center;
+                margin: 20px 0;
+                padding: 25px;
+                background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+                border-radius: 15px;
+                border: 2px solid #10b981;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 WhatsApp Bot API</h1>
+            <div class="status disconnected" id="status">Checking...</div>
+            
+            <div class="info">
+                <p><strong>📡 Platform:</strong> Vercel Serverless</p>
+                <p><strong>🔧 Runtime:</strong> Node.js</p>
+                <p><strong>📦 Library:</strong> Baileys 6.5.0</p>
+                <p><strong>💾 Storage:</strong> MongoDB</p>
+            </div>
+            
+            <div class="endpoints">
+                <h3 style="margin-bottom: 15px;">📚 Available Endpoints</h3>
+                
+                <div class="endpoint">
+                    <strong>POST /send-message</strong>
+                    <p style="margin: 8px 0; color: #666;">Send text message to WhatsApp number</p>
+                    <code>{ "phone": "6281234567890", "message": "Hello from bot!" }</code>
+                </div>
+                
+                <div class="endpoint">
+                    <strong>GET /status</strong>
+                    <p style="margin: 8px 0; color: #666;">Get bot connection status</p>
+                </div>
+                
+                <div class="endpoint">
+                    <strong>GET /qr</strong>
+                    <p style="margin: 8px 0; color: #666;">Get QR code for authentication</p>
+                </div>
+                
+                <div class="endpoint">
+                    <strong>GET /health</strong>
+                    <p style="margin: 8px 0; color: #666;">Health check endpoint</p>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px; text-align: center;">
+                <button onclick="checkStatus()">🔄 Check Status</button>
+                <button onclick="getQR()">📱 Get QR Code</button>
+            </div>
+
+            <div id="qr-container" style="display: none;"></div>
+        </div>
+        
+        <script>
+            async function checkStatus() {
+                try {
+                    const response = await fetch('/status');
+                    const data = await response.json();
+                    
+                    const statusEl = document.getElementById('status');
+                    if (data.status === 'connected') {
+                        statusEl.className = 'status connected';
+                        statusEl.textContent = '✅ Connected';
+                    } else {
+                        statusEl.className = 'status disconnected';
+                        statusEl.textContent = '❌ Disconnected';
+                    }
+                    
+                    alert(JSON.stringify(data, null, 2));
+                } catch (error) {
+                    alert('Error: ' + error.message);
+                }
+            }
+
+            async function getQR() {
+                try {
+                    const response = await fetch('/qr');
+                    const data = await response.json();
+                    
+                    if (data.success && data.qr) {
+                        const qrContainer = document.getElementById('qr-container');
+                        qrContainer.innerHTML = '<div class="qr-section"><h3>📱 Scan QR Code</h3><img src="' + data.qr + '" style="max-width: 300px; margin: 20px auto;"/><p style="color: #059669;">Open WhatsApp → Settings → Linked Devices → Link a Device</p></div>';
+                        qrContainer.style.display = 'block';
+                    } else {
+                        alert(data.message);
+                    }
+                } catch (error) {
+                    alert('Error: ' + error.message);
+                }
+            }
+
+            // Auto check status on load
+            window.onload = checkStatus;
+        </script>
+    </body>
+    </html>
+    `;
+}
+
+// Keep connection alive (Vercel has 10s timeout for serverless, but we can try)
+setInterval(() => {
+    if (sock && isConnected) {
+        console.log('Keeping connection alive...');
+    }
+}, 30000);
