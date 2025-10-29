@@ -1,0 +1,20 @@
+{
+  "name": "whatsapp-bot-vercel",
+  "version": "2.0.0",
+  "description": "WhatsApp Bot for Warranty System on Vercel",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.5.0",
+    "pino": "^8.16.0"
+  },
+  "devDependencies": {
+    "vercel": "^33.0.0"
+  }
+}
