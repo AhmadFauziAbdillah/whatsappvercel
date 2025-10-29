@@ -1,18 +1,24 @@
 {
   "name": "whatsapp-bot-vercel",
-  "version": "2.0.0",
-  "description": "WhatsApp Bot for Warranty System on Vercel",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot for Vercel Serverless",
   "type": "module",
+  "main": "api/index.js",
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod"
   },
+  "keywords": ["whatsapp", "bot", "baileys", "vercel", "serverless"],
+  "author": "",
+  "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.5.0",
-    "pino": "^8.16.0"
+    "pino": "^8.16.0",
+    "qrcode": "^1.5.3",
+    "mongodb": "^6.3.0"
   },
   "devDependencies": {
     "vercel": "^33.0.0"
